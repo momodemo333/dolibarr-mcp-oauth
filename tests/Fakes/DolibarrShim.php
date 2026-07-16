@@ -48,6 +48,14 @@ if (!function_exists('dolDecrypt')) {
     }
 }
 
+if (!function_exists('dol_string_nounprintableascii')) {
+    function dol_string_nounprintableascii(string $str, int $removetabcrlf = 1): string
+    {
+        $pattern = $removetabcrlf ? '/[\x00-\x1F\x7F]/u' : '/[\x00-\x08\x11-\x12\x14-\x1F\x7F]/u';
+        return (string) preg_replace($pattern, '', $str);
+    }
+}
+
 if (!isset($GLOBALS['conf'])) {
     $GLOBALS['conf'] = (object) ['entity' => 1];
 }

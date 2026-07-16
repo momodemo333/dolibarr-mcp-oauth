@@ -19,8 +19,21 @@ final class FakeDoliDB
     /** @var array<string, int> */
     private array $autoIncrement = [];
 
+    /** @var array<string, array{login: string, status: int}> api_key (clear) => user row, for the aliased OR-based llx_user lookup used by HttpEndpoint */
+    private array $seededApiKeys = [];
+
     private string $lastError = '';
     private string $lastTable = '';
+
+    /**
+     * Make the "SELECT ... FROM ...user as u WHERE u.api_key = '...' OR
+     * u.api_key = '...'" lookup (HttpEndpoint's llx_user validation, mirroring
+     * the native REST API) succeed for this clear-text key.
+     */
+    public function seedUserApiKey(string $key, string $login = 'testuser', int $status = 1): void
+    {
+        $this->seededApiKeys[$key] = ['login' => $login, 'status' => $status];
+    }
 
     public function escape($value): string
     {
@@ -41,6 +54,13 @@ final class FakeDoliDB
 
         if (preg_match('/^INSERT INTO\s+(\S+)\s*\(([^)]*)\)\s*VALUES\s*\((.*)\)$/is', $sql, $m)) {
             return $this->handleInsert($m[1], $m[2], $m[3]);
+        }
+        // Aliased OR-based lookup ("... as u WHERE u.api_key = 'x' OR u.api_key = 'y'"),
+        // as issued by HttpEndpoint::resolveApiKey(). Not a generic SQL engine:
+        // this one shape is special-cased since the generic handlers below only
+        // understand AND-only WHERE clauses without table aliases.
+        if (preg_match('/^SELECT\s+u\.rowid.*?\s+FROM\s+\S+\s+as\s+u\s+WHERE\s+u\.api_key\s*=\s*\'((?:[^\'\\\\]|\\\\.)*)\'\s+OR\s+u\.api_key\s*=\s*\'(?:[^\'\\\\]|\\\\.)*\'\s*$/is', $sql, $m)) {
+            return $this->handleUserApiKeySelect($m[1]);
         }
         if (preg_match('/^SELECT\s+.*?\s+FROM\s+(\S+)(?:\s+WHERE\s+(.*))?$/is', $sql, $m)) {
             return $this->handleSelect($m[1], $m[2] ?? '');
@@ -103,6 +123,20 @@ final class FakeDoliDB
         $this->lastTable = $table;
 
         return true;
+    }
+
+    private function handleUserApiKeySelect(string $rawEscapedKey): FakeResultSet
+    {
+        $key = stripslashes($rawEscapedKey);
+
+        if (!isset($this->seededApiKeys[$key])) {
+            return new FakeResultSet([]);
+        }
+
+        $seed = $this->seededApiKeys[$key];
+        return new FakeResultSet([
+            ['rowid' => 1, 'login' => $seed['login'], 'status' => $seed['status']],
+        ]);
     }
 
     private function handleSelect(string $table, string $where): FakeResultSet
