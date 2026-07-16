@@ -112,7 +112,7 @@ final class HttpEndpoint
             $userApiKey = $this->oauthServer->getUserApiKey((int) $tokenRow->fk_user);
             if ($userApiKey === null) {
                 dol_syslog('['.$this->config->logPrefix.'] OAuth token valid but user API key unavailable: '.$this->oauthServer->error, LOG_ERR);
-                return new AuthResult(null, 401, 'Access token valid but the linked Dolibarr user is unavailable');
+                return new AuthResult(null, 403, 'Access token valid but the linked Dolibarr user is unavailable');
             }
 
             $apiKey = $userApiKey; // downstream flow is identical to direct API key auth
