@@ -1,0 +1,53 @@
+<?php
+declare(strict_types=1);
+namespace DolibarrMcpOAuth\Tests;
+
+use DolibarrMcpOAuth\{OAuthServer, ExposureConfig};
+use DolibarrMcpOAuth\Tests\Fakes\FakeDoliDB;
+use PHPUnit\Framework\TestCase;
+
+final class OAuthServerTest extends TestCase
+{
+    private function server(FakeDoliDB $db): OAuthServer
+    {
+        return new OAuthServer($db, new ExposureConfig('emmcp', 'emcp_', 'EMMCP', 'emmcp'));
+    }
+
+    public function testRegisterClientRejectsMissingRedirectUris(): void
+    {
+        $db = new FakeDoliDB();
+        $out = $this->server($db)->registerClient([]);
+        $this->assertNull($out);
+    }
+
+    public function testRegisterPublicClientReturnsClientIdWithConfiguredPrefix(): void
+    {
+        $db = new FakeDoliDB();
+        $out = $this->server($db)->registerClient(['redirect_uris' => ['https://claude.ai/api/mcp/auth_callback']]);
+        $this->assertStringStartsWith('emcp_client_', $out['client_id']);
+        $this->assertSame('none', $out['token_endpoint_auth_method']);
+    }
+
+    public function testExchangeAuthorizationCodeValidatesPkceS256(): void
+    {
+        // verifier/challenge computed the RFC 7636 way; wrong verifier must fail
+        $verifier = 'abcdefabcdefabcdefabcdefabcdefabcdefabcdef123';
+        $challenge = rtrim(strtr(base64_encode(hash('sha256', $verifier, true)), '+/', '-_'), '=');
+        $db = new FakeDoliDB();
+        $srv = $this->server($db);
+        $client = (object) ['rowid' => 1, 'token_endpoint_auth_method' => 'none'];
+        $code = $srv->createAuthorizationCode($client, 7, 'https://claude.ai/api/mcp/auth_callback', $challenge, 'dolibarr', 'https://x/mcp.php');
+        $this->assertNull($srv->exchangeAuthorizationCode($client, $code, 'https://claude.ai/api/mcp/auth_callback', 'WRONG-verifier'));
+        $tokens = $srv->exchangeAuthorizationCode($client, $srv->createAuthorizationCode($client, 7, 'https://claude.ai/api/mcp/auth_callback', $challenge, 'dolibarr', 'https://x/mcp.php'), 'https://claude.ai/api/mcp/auth_callback', $verifier);
+        $this->assertStringStartsWith('emcp_a', $tokens['access_token']);
+        $this->assertStringStartsWith('emcp_r', $tokens['refresh_token']);
+    }
+
+    public function testTableNameUsesConfiguredPrefix(): void
+    {
+        $db = new FakeDoliDB();
+        (new OAuthServer($db, new ExposureConfig('dalfred', 'dcp_', 'DALFRED', 'dalfred')))
+            ->registerClient(['redirect_uris' => ['https://claude.ai/api/mcp/auth_callback']]);
+        $this->assertStringContainsString('llx_dalfred_oauth_client', $db->lastInsertTable());
+    }
+}
