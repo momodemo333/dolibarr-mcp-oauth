@@ -45,7 +45,6 @@ new ExposureConfig(
     string $tablePrefix,   // 'emmcp'   -> llx_emmcp_oauth_client / llx_emmcp_oauth_token
     string $tokenPrefix,   // 'emcp_'   -> issued tokens look like emcp_a<hex>, emcp_r<hex>, emcp_c<hex>
     string $logPrefix,     // 'EMMCP'   -> dol_syslog lines prefixed '[EMMCP] ...'
-    string $moduleSlug,    // 'emmcp'   -> used to build routes, e.g. /emmcp/oauth.php
 );
 ```
 
@@ -58,9 +57,6 @@ new ExposureConfig(
   used as the prefix on registered `client_id`s (`emcp_client_...`).
 - **`$logPrefix`** — used verbatim in every `dol_syslog('[' . logPrefix . '] ...')`
   call so `grep '\[EMMCP\]' dolibarr.log` finds only this module's lines.
-- **`$moduleSlug`** — the module's directory name under `/custom/`, used to
-  build the `WWW-Authenticate` resource-metadata URL and any other
-  self-referencing route.
 
 TTLs are fixed constants shared by every consumer (not configurable per
 module): `ExposureConfig::ACCESS_TOKEN_TTL` (3600s), `REFRESH_TOKEN_TTL`
@@ -82,7 +78,7 @@ use DolibarrMcpOAuth\ExposureConfig;
 use DolibarrMcpOAuth\HttpEndpoint;
 use DolibarrMcpOAuth\Support\UrlHelper;
 
-$config = new ExposureConfig('emmcp', 'emcp_', 'EMMCP', 'emmcp');
+$config = new ExposureConfig('emmcp', 'emcp_', 'EMMCP');
 $endpoint = new HttpEndpoint($db, $config);
 
 // $getPost wraps Dolibarr's GETPOST(); note the 2nd arg here is the
@@ -93,7 +89,8 @@ $getPost = fn(string $name, $default) => GETPOST($name, 'alphanohtml') ?: $defau
 
 $auth = $endpoint->resolveApiKey($_SERVER, $getPost);
 if ($auth->apiKey === null) {
-    header('WWW-Authenticate: '.$endpoint->wwwAuthenticateHeader(new UrlHelper()));
+    $prm = UrlHelper::publicUrl('/emmcp/oauth.php').'/.well-known/oauth-protected-resource';
+    header('WWW-Authenticate: '.$endpoint->wwwAuthenticateHeader($prm));
     http_response_code($auth->httpCode);
     header('Content-Type: application/json');
     echo json_encode(['error' => $auth->error]);
@@ -116,7 +113,7 @@ use DolibarrMcpOAuth\OAuthServer;
 use DolibarrMcpOAuth\OAuthRouter;
 use DolibarrMcpOAuth\Support\UrlHelper;
 
-$config = new ExposureConfig('emmcp', 'emcp_', 'EMMCP', 'emmcp');
+$config = new ExposureConfig('emmcp', 'emcp_', 'EMMCP');
 $server = new OAuthServer($db, $config);
 $router = new OAuthRouter(
     $server,
@@ -125,21 +122,28 @@ $router = new OAuthRouter(
     UrlHelper::publicUrl('/emmcp/mcp.php'),   // protected resource URL
 );
 
-$action = GETPOST('action', 'aZ09') ?: ($_SERVER['PATH_INFO'] ?? '');
+// Route on PATH_INFO (or a ?route= fallback), NOT on GETPOST('action'):
+// the consent form below POSTs action=consent to this same /authorize URL,
+// so using 'action' for outer routing would misroute that POST away from
+// the '/authorize' case. 'action' is only read *inside* the '/authorize'
+// case, to tell the initial GET apart from the consent POST.
+$route = !empty($_SERVER['PATH_INFO'])
+    ? rtrim($_SERVER['PATH_INFO'], '/')
+    : '/'.ltrim((string) GETPOST('route', 'alpha'), '/');
 
 switch (true) {
-    case str_ends_with($action, '.well-known/oauth-authorization-server'):
-    case str_ends_with($action, '.well-known/openid-configuration'):
+    case str_ends_with($route, '.well-known/oauth-authorization-server'):
+    case str_ends_with($route, '.well-known/openid-configuration'):
         header('Content-Type: application/json');
         echo json_encode($router->metadataAuthorizationServer());
         break;
 
-    case str_ends_with($action, '.well-known/oauth-protected-resource'):
+    case str_ends_with($route, '.well-known/oauth-protected-resource'):
         header('Content-Type: application/json');
         echo json_encode($router->metadataProtectedResource());
         break;
 
-    case str_ends_with($action, '/register'):
+    case str_ends_with($route, '/register'):
         $body = json_decode(file_get_contents('php://input'), true) ?: [];
         $result = $router->handleRegister($body);
         http_response_code($result['httpCode']);
@@ -147,7 +151,7 @@ switch (true) {
         echo json_encode($result['payload']);
         break;
 
-    case str_ends_with($action, '/token'):
+    case str_ends_with($route, '/token'):
         $getPost = fn(string $name, $default) => GETPOST($name, 'alphanohtml') ?: $default;
         $result = $router->handleToken($getPost, $_SERVER);
         http_response_code($result['httpCode']);
@@ -155,8 +159,27 @@ switch (true) {
         echo json_encode($result['payload']);
         break;
 
-    case str_ends_with($action, '/authorize'):
-        $decision = $router->validateAuthorizeRequest($_GET);
+    case str_ends_with($route, '/authorize'):
+        // GETPOST-sourced (GET+POST): the initial request is a GET, but on
+        // the consent form submission these same fields arrive as POST
+        // hidden fields, so a plain $_GET array would miss them there.
+        $params = [
+            'client_id' => GETPOST('client_id', 'alphanohtml'),
+            'redirect_uri' => GETPOST('redirect_uri', 'alphanohtml'),
+            'state' => GETPOST('state', 'alphanohtml'),
+            'scope' => GETPOST('scope', 'alphanohtml'),
+            'resource' => GETPOST('resource', 'alphanohtml'),
+            'response_type' => GETPOST('response_type', 'alphanohtml'),
+            'code_challenge' => GETPOST('code_challenge', 'alphanohtml'),
+            'code_challenge_method' => GETPOST('code_challenge_method', 'alphanohtml'),
+        ];
+        // Re-validating client_id/redirect_uri/PKCE here on the consent POST
+        // too (not just on the initial GET) is a deliberate security
+        // property, not incidental duplication: it re-confirms the redirect
+        // target is still one of the client's registered URIs immediately
+        // before minting an authorization code for it.
+        $decision = $router->validateAuthorizeRequest($params);
+
         if (!$decision->valid && $decision->redirectUri === null) {
             // Open-redirect protection: unknown client_id or unregistered
             // redirect_uri means there is no safe place to send the user.
@@ -167,14 +190,38 @@ switch (true) {
         }
         if (!$decision->valid) {
             // Validated redirect target, but response_type/PKCE are wrong:
-            // bounce back to the client with the OAuth error.
-            header('Location: '.$decision->redirectUri.'?error='.urlencode($decision->error)
-                .'&state='.urlencode((string) $decision->state));
+            // bounce back to the client with the OAuth error. buildRedirect()
+            // appends with '&' instead of '?' when the registered
+            // redirect_uri already carries its own query string.
+            $errorParams = ['error' => $decision->error, 'state' => $decision->state];
+            if ($decision->errorDescription !== null) {
+                $errorParams['error_description'] = $decision->errorDescription;
+            }
+            header('Location: '.UrlHelper::buildRedirect($decision->redirectUri, $errorParams), true, 302);
             break;
         }
-        // $decision->valid: render the consent screen here (llxHeader(),
-        // newToken(), $user, $langs — this HTML stays in the module, see below),
-        // and on POST/accept call $server->createAuthorizationCode(...).
+
+        if (GETPOST('action', 'aZ09') === 'consent' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+            // CSRF is enforced by main.inc.php (token checked on POST).
+            if (GETPOST('decision', 'aZ09') === 'accept') {
+                $code = $server->createAuthorizationCode($decision->client, (int) $user->id, $decision->redirectUri, $decision->codeChallenge, $decision->scope, $decision->resource);
+                if ($code === null) {
+                    header('Location: '.UrlHelper::buildRedirect($decision->redirectUri, ['error' => 'server_error', 'state' => $decision->state]), true, 302);
+                    break;
+                }
+                header('Location: '.UrlHelper::buildRedirect($decision->redirectUri, ['code' => $code, 'state' => $decision->state]), true, 302);
+                break;
+            }
+            header('Location: '.UrlHelper::buildRedirect($decision->redirectUri, ['error' => 'access_denied', 'state' => $decision->state]), true, 302);
+            break;
+        }
+
+        // GET (or POST without action=consent yet): render the consent
+        // screen here (llxHeader(), newToken(), $user, $langs — this HTML
+        // stays in the module, see below). Its <form> must post back
+        // client_id/redirect_uri/state/scope/resource/response_type/
+        // code_challenge/code_challenge_method as hidden fields plus
+        // action=consent, so the block above sees them on submission.
         break;
 }
 ```

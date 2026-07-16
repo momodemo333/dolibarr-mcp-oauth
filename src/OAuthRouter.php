@@ -179,21 +179,26 @@ final class OAuthRouter
      * Validate a GET/POST /authorize request up to (but not including)
      * rendering the consent screen or creating the authorization code.
      *
-     * @param array $get Sanitized request params: client_id, redirect_uri,
-     *                   state, scope, response_type, code_challenge,
+     * @param array $params Sanitized request params: client_id, redirect_uri,
+     *                   state, scope, resource, response_type, code_challenge,
      *                   code_challenge_method (same names as the source's
-     *                   GETPOST() calls)
+     *                   GETPOST() calls). Must be sourced from BOTH GET and
+     *                   POST (Dolibarr's GETPOST() reads both): the initial
+     *                   request arrives as a GET, but on the consent form
+     *                   submission these same fields arrive as POST hidden
+     *                   fields.
      * @return AuthorizeDecision
      */
-    public function validateAuthorizeRequest(array $get): AuthorizeDecision
+    public function validateAuthorizeRequest(array $params): AuthorizeDecision
     {
-        $clientId = (string) ($get['client_id'] ?? '');
-        $redirectUri = (string) ($get['redirect_uri'] ?? '');
-        $state = (string) ($get['state'] ?? '');
-        $scope = (string) ($get['scope'] ?? '');
-        $responseType = (string) ($get['response_type'] ?? '');
-        $codeChallenge = (string) ($get['code_challenge'] ?? '');
-        $codeChallengeMethod = (string) ($get['code_challenge_method'] ?? '');
+        $clientId = (string) ($params['client_id'] ?? '');
+        $redirectUri = (string) ($params['redirect_uri'] ?? '');
+        $state = (string) ($params['state'] ?? '');
+        $scope = (string) ($params['scope'] ?? '');
+        $resource = (string) ($params['resource'] ?? '');
+        $responseType = (string) ($params['response_type'] ?? '');
+        $codeChallenge = (string) ($params['code_challenge'] ?? '');
+        $codeChallengeMethod = (string) ($params['code_challenge_method'] ?? '');
 
         $client = $this->server->getClient($clientId);
 
@@ -209,6 +214,8 @@ final class OAuthRouter
                 state: $state,
                 error: 'Invalid OAuth request: unknown client_id or unregistered redirect_uri.',
                 httpCode: 400,
+                errorDescription: null,
+                resource: $resource,
             );
         }
 
@@ -222,6 +229,8 @@ final class OAuthRouter
                 state: $state,
                 error: 'unsupported_response_type',
                 httpCode: null,
+                errorDescription: null,
+                resource: $resource,
             );
         }
 
@@ -235,6 +244,8 @@ final class OAuthRouter
                 state: $state,
                 error: 'invalid_request',
                 httpCode: null,
+                errorDescription: 'PKCE S256 required',
+                resource: $resource,
             );
         }
 
@@ -247,6 +258,8 @@ final class OAuthRouter
             state: $state,
             error: null,
             httpCode: null,
+            errorDescription: null,
+            resource: $resource,
         );
     }
 }

@@ -2,8 +2,6 @@
 declare(strict_types=1);
 namespace DolibarrMcpOAuth;
 
-use DolibarrMcpOAuth\Support\UrlHelper;
-
 /* Copyright (C) 2026 E-dem
  *
  * This program is free software; you can redistribute it and/or modify
@@ -149,13 +147,13 @@ final class HttpEndpoint
      * clients (claude.ai connectors...) can run the discovery + authorization
      * flow (RFC 9728 §5.1).
      *
-     * @param UrlHelper $url URL helper (publicUrl() resolution)
+     * @param string $oauthProtectedResourceUrl Absolute URL of the module's
+     *               oauth.php Protected Resource Metadata document (the
+     *               caller builds this via UrlHelper::publicUrl(...))
      * @return string Header value (without the "WWW-Authenticate:" name)
      */
-    public function wwwAuthenticateHeader(UrlHelper $url): string
+    public function wwwAuthenticateHeader(string $oauthProtectedResourceUrl): string
     {
-        $prm = $url->publicUrl('/'.$this->config->moduleSlug.'/oauth.php').'/.well-known/oauth-protected-resource';
-
-        return 'Bearer resource_metadata="'.$prm.'", scope="dolibarr"';
+        return 'Bearer resource_metadata="'.$oauthProtectedResourceUrl.'", scope="dolibarr"';
     }
 }

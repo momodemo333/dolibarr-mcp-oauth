@@ -45,6 +45,10 @@ final class AuthorizeDecision
      * @param string|null $state        Opaque state to echo back
      * @param string|null $error        Error identifier/message, when $valid is false
      * @param int|null    $httpCode     HTTP status to use for a non-redirect error response
+     * @param string|null $errorDescription Human-readable detail to accompany $error (mirrors
+     *                                  the source's error_description query parameter), when set
+     * @param string|null $resource     RFC 8707 resource indicator from the request, carried
+     *                                  through so the consent glue doesn't have to re-read it
      */
     public function __construct(
         public readonly bool $valid,
@@ -55,6 +59,8 @@ final class AuthorizeDecision
         public readonly ?string $state = null,
         public readonly ?string $error = null,
         public readonly ?int $httpCode = null,
+        public readonly ?string $errorDescription = null,
+        public readonly ?string $resource = null,
     ) {
     }
 }

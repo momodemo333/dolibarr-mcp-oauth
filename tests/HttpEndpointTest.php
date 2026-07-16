@@ -1,4 +1,5 @@
 <?php
+declare(strict_types=1);
 namespace DolibarrMcpOAuth\Tests;
 use DolibarrMcpOAuth\{HttpEndpoint, ExposureConfig, OAuthServer};
 use DolibarrMcpOAuth\Tests\Fakes\FakeDoliDB;
@@ -8,7 +9,7 @@ final class HttpEndpointTest extends TestCase
 {
     private function config(): ExposureConfig
     {
-        return new ExposureConfig('emmcp', 'emcp_', 'EMMCP', 'emmcp');
+        return new ExposureConfig('emmcp', 'emcp_', 'EMMCP');
     }
 
     private function ep(FakeDoliDB $db): HttpEndpoint

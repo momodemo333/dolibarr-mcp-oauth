@@ -38,3 +38,24 @@ Extracted from emMCP 1.0.1; parameterized via `ExposureConfig`.
   `HttpEndpoint`, `OAuthRouter`, and the `Support` helpers, with a
   `FakeDoliDB` and shimmed Dolibarr globals so the library is testable
   outside a live Dolibarr instance.
+
+### Known divergences from the emMCP source
+
+Three intentionally accepted differences from `htdocs/custom/emmcp/oauth.php`
+/ `mcp.php`, each unreachable in practice with a real registered client:
+
+- `OAuthRouter::handleToken()` checks `grant_type` before looking up the
+  client, so a request that is *both* an unknown/bad client *and* an
+  unsupported `grant_type` gets a 400 `unsupported_grant_type` instead of the
+  401 `invalid_client` the source would return in that order. A real
+  registered client always sends a supported `grant_type`, so this ordering
+  difference is not reachable by any legitimate caller.
+- The no-safe-redirect `/authorize` error path returns `httpCode: 400` in
+  `AuthorizeDecision`, whereas the source's inline HTML error page implicitly
+  responds with the default 200 status. Both stop the flow the same way; only
+  the machine-readable status code differs, and no client parses it (the page
+  is meant for a human).
+- `HttpEndpoint::resolveApiKey()` uses `=== ''` where the source uses
+  `empty()` for the credential fallback chain. The two differ only for the
+  literal string `"0"`, which is never a valid key in either implementation
+  (issued keys are 40 hex characters), so no real request can hit this edge.

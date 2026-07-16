@@ -65,6 +65,21 @@ final class UrlHelper
     }
 
     /**
+     * Build a redirect URL by appending query parameters, the same way the
+     * source emMCP oauth.php's local emmcp_oauth_redirect() helper does:
+     * '?' when $uri has no query string yet, '&' when it already has one
+     * (a registered redirect_uri may already carry its own query params).
+     *
+     * @param string $uri    Validated redirect URI
+     * @param array  $params Query parameters to append
+     * @return string $uri with $params appended to its query string
+     */
+    public static function buildRedirect(string $uri, array $params): string
+    {
+        return $uri.(strpos($uri, '?') === false ? '?' : '&').http_build_query($params);
+    }
+
+    /**
      * Render a read-only code block with a native "copy to clipboard" button.
      *
      * Uses htmlspecialchars (not dol_escape_htmltag) so real newlines in the
