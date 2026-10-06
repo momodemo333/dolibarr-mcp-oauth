@@ -109,8 +109,11 @@ final class HttpEndpoint
 
             $userApiKey = $this->oauthServer->getUserApiKey((int) $tokenRow->fk_user);
             if ($userApiKey === null) {
-                dol_syslog('['.$this->config->logPrefix.'] OAuth token valid but user API key unavailable: '.$this->oauthServer->error, LOG_ERR);
-                return new AuthResult(null, 403, 'Access token valid but the linked Dolibarr user is unavailable');
+                // The user was disabled or their API key removed: the access
+                // is over. 401 rather than 403, so the client goes back
+                // through sign-in and consent instead of retrying.
+                dol_syslog('['.$this->config->logPrefix.'] OAuth token refused, linked user no longer usable: '.$this->oauthServer->error, LOG_NOTICE);
+                return new AuthResult(null, 401, 'Access revoked for the linked Dolibarr user');
             }
 
             $apiKey = $userApiKey; // downstream flow is identical to direct API key auth
@@ -140,6 +143,34 @@ final class HttpEndpoint
         dol_syslog('['.$this->config->logPrefix.'] MCP request authenticated for user '.$obj->login, LOG_DEBUG);
 
         return new AuthResult($apiKey, null, null);
+    }
+
+    /**
+     * Tell whether an Authorization header reached PHP, through any of the
+     * sources authentication reads.
+     *
+     * Used by the self-test of the module's admin page: Apache running PHP
+     * as CGI or FastCGI drops the header unless configured otherwise, a
+     * .htaccess is ignored by many hosts, and the only symptom is a 401
+     * right after a successful sign-in.
+     *
+     * @param array $server $_SERVER-like array
+     * @return bool
+     */
+    public static function seesAuthorizationHeader(array $server): bool
+    {
+        if (!empty($server['HTTP_AUTHORIZATION']) || !empty($server['REDIRECT_HTTP_AUTHORIZATION'])) {
+            return true;
+        }
+        if (function_exists('getallheaders')) {
+            foreach (getallheaders() as $name => $value) {
+                if (strtolower((string) $name) === 'authorization' && $value !== '') {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     /**

@@ -29,6 +29,7 @@ final class ExposureConfig
     public const ACCESS_TOKEN_TTL = 3600;
     public const REFRESH_TOKEN_TTL = 2592000;
     public const AUTH_CODE_TTL = 120;
+    public const REGISTRATIONS_PER_HOUR = 50;
 
     public function __construct(
         public readonly string $tablePrefix,
@@ -40,4 +41,5 @@ final class ExposureConfig
     public function accessTokenTtl(): int { return self::ACCESS_TOKEN_TTL; }
     public function refreshTokenTtl(): int { return self::REFRESH_TOKEN_TTL; }
     public function authCodeTtl(): int { return self::AUTH_CODE_TTL; }
+    public function registrationsPerHour(): int { return self::REGISTRATIONS_PER_HOUR; }
 }

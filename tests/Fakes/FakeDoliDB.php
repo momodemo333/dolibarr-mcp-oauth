@@ -166,6 +166,7 @@ final class FakeDoliDB
             }
         }
 
+        $this->lastAffected = 0;
         if (!isset($this->tables[$table])) {
             return true;
         }
@@ -175,11 +176,20 @@ final class FakeDoliDB
                 foreach ($assignments as $col => $val) {
                     $row[$col] = $val;
                 }
+                $this->lastAffected++;
             }
         }
         unset($row);
 
         return true;
+    }
+
+    /** Rows touched by the last UPDATE, as DoliDB::affected_rows() reports. */
+    private int $lastAffected = 0;
+
+    public function affected_rows($resql): int
+    {
+        return $this->lastAffected;
     }
 
     private function handleDelete(string $table, string $where): bool

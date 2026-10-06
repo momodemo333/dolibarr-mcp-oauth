@@ -80,6 +80,15 @@ class OAuthServer
 			return null;
 		}
 
+		// /register takes no credential, so it is the one route anybody can use
+		// to write into the database. A ceiling per hour keeps a loop or a
+		// scanner from filling the client table; unused clients are purged by
+		// purgeExpired().
+		if ($this->countRecentRegistrations() >= $this->config->registrationsPerHour()) {
+			$this->error = 'too_many_registrations';
+			return null;
+		}
+
 		$clientId = $this->config->tokenPrefix.'client_'.bin2hex(random_bytes(16));
 		$clientSecret = null;
 		$secretHash = null;
@@ -248,13 +257,25 @@ class OAuthServer
 	public function exchangeAuthorizationCode($client, $code, $redirectUri, $codeVerifier)
 	{
 		$row = $this->getValidToken('code', $code);
-		if (!$row || (int) $row->fk_client !== (int) $client->rowid) {
+		if (!$row) {
+			$this->revokeReplayedFamily('code', $code, (int) $client->rowid);
+			$this->error = 'invalid_grant';
+			return null;
+		}
+		if ((int) $row->fk_client !== (int) $client->rowid) {
 			$this->error = 'invalid_grant';
 			return null;
 		}
 
-		// One-shot: revoke immediately, whatever happens next
-		$this->revokeToken($row->rowid);
+		// One-shot, and the revocation is what claims it: of two concurrent
+		// exchanges of the same code, only the one whose UPDATE actually
+		// flipped the row gets tokens. Revoked before anything else is
+		// checked, since a code that survives a failed exchange can be
+		// replayed.
+		if (!$this->revokeToken($row->rowid)) {
+			$this->error = 'invalid_grant';
+			return null;
+		}
 
 		if (!empty($row->redirect_uri) && $row->redirect_uri !== $redirectUri) {
 			$this->error = 'invalid_grant';
@@ -285,12 +306,21 @@ class OAuthServer
 	public function refreshTokens($client, $refreshToken)
 	{
 		$row = $this->getValidToken('refresh', $refreshToken);
-		if (!$row || (int) $row->fk_client !== (int) $client->rowid) {
+		if (!$row) {
+			$this->revokeReplayedFamily('refresh', $refreshToken, (int) $client->rowid);
+			$this->error = 'invalid_grant';
+			return null;
+		}
+		if ((int) $row->fk_client !== (int) $client->rowid) {
 			$this->error = 'invalid_grant';
 			return null;
 		}
 
-		$this->revokeToken($row->rowid);
+		// Same claim as for codes: rotation means a refresh token works once.
+		if (!$this->revokeToken($row->rowid)) {
+			$this->error = 'invalid_grant';
+			return null;
+		}
 
 		return $this->issueTokenPair((int) $client->rowid, (int) $row->fk_user, (string) $row->scope, (string) $row->resource);
 	}
@@ -307,13 +337,42 @@ class OAuthServer
 	}
 
 	/**
-	 * Resolve the Dolibarr REST API key of a user (generating one if absent),
-	 * so the MCP tools can act through the REST API on the user's behalf.
+	 * Resolve the Dolibarr REST API key of a user, so the MCP tools can act
+	 * through the REST API on the user's behalf.
+	 *
+	 * Read only. Up to 1.0.x this generated a key when the user had none, on
+	 * every request: removing a user's API key — the natural way for an
+	 * administrator to cut someone's API access — was silently undone by
+	 * the next MCP call, and the access could not be revoked. A key is now
+	 * created only at consent (ensureUserApiKey()), so removing it ends every
+	 * OAuth access of that user until they consent again.
 	 *
 	 * @param int $userId User rowid
 	 * @return string|null Clear-text API key, or null ($this->error set)
 	 */
 	public function getUserApiKey($userId)
+	{
+		return $this->readUserApiKey($userId, false);
+	}
+
+	/**
+	 * Make sure a user has a REST API key, creating one if needed. Called at
+	 * consent, the moment the user explicitly grants access.
+	 *
+	 * @param int $userId User rowid
+	 * @return string|null Clear-text API key, or null ($this->error set)
+	 */
+	public function ensureUserApiKey($userId)
+	{
+		return $this->readUserApiKey($userId, true);
+	}
+
+	/**
+	 * @param int  $userId User rowid
+	 * @param bool $create Create a key when the user has none
+	 * @return string|null
+	 */
+	private function readUserApiKey($userId, $create)
 	{
 		$sql = "SELECT api_key FROM ".MAIN_DB_PREFIX."user";
 		$sql .= " WHERE rowid = ".((int) $userId)." AND statut = 1";
@@ -330,6 +389,11 @@ class OAuthServer
 			if (!empty($key) && !preg_match('/^dolcrypt:/i', $key)) {
 				return $key;
 			}
+		}
+
+		if (!$create) {
+			$this->error = 'The user has no REST API key (access revoked)';
+			return null;
 		}
 
 		// No usable key: generate one (same storage convention as the user card)
@@ -356,6 +420,94 @@ class OAuthServer
 		$sql = "DELETE FROM ".MAIN_DB_PREFIX.$this->config->tablePrefix."_oauth_token";
 		$sql .= " WHERE expires_at < '".$this->db->idate(dol_now() - 86400)."'";
 		$this->db->query($sql);
+
+		// A registration that never led to a token is a row nobody asked
+		// for: /register takes no credential, so without this the client
+		// table only grows, one row per connection attempt. A client that
+		// did obtain a token is kept whatever its age.
+		$sql = "DELETE FROM ".MAIN_DB_PREFIX.$this->config->tablePrefix."_oauth_client";
+		$sql .= " WHERE datec < '".$this->db->idate(dol_now() - 86400)."'";
+		$sql .= " AND rowid NOT IN (SELECT fk_client FROM ".MAIN_DB_PREFIX.$this->config->tablePrefix."_oauth_token WHERE fk_client IS NOT NULL)";
+		$this->db->query($sql);
+	}
+
+	// --- Grants, for the administrator ------------------------------------------
+
+	/**
+	 * List the accesses currently granted: one line per client and user that
+	 * still holds a usable refresh token.
+	 *
+	 * @return array<int, object> Rows with fk_client, client_name, client_id,
+	 *                            fk_user, login, granted (first token), last_used
+	 *                            (latest token), expires (latest expiry)
+	 */
+	public function listGrants()
+	{
+		global $conf;
+
+		$t = MAIN_DB_PREFIX.$this->config->tablePrefix;
+		$sql = "SELECT t.fk_client, t.fk_user, c.client_name, c.client_id, u.login,";
+		$sql .= " MIN(t.datec) as granted, MAX(t.datec) as last_used, MAX(t.expires_at) as expires";
+		$sql .= " FROM ".$t."_oauth_token as t";
+		$sql .= " INNER JOIN ".$t."_oauth_client as c ON c.rowid = t.fk_client";
+		$sql .= " LEFT JOIN ".MAIN_DB_PREFIX."user as u ON u.rowid = t.fk_user";
+		$sql .= " WHERE t.token_type = 'refresh' AND t.revoked = 0";
+		$sql .= " AND t.expires_at > '".$this->db->idate(dol_now())."'";
+		$sql .= " AND t.entity = ".((int) $conf->entity);
+		$sql .= " GROUP BY t.fk_client, t.fk_user, c.client_name, c.client_id, u.login";
+		$sql .= " ORDER BY last_used DESC";
+
+		$rows = array();
+		$resql = $this->db->query($sql);
+		if ($resql) {
+			while ($obj = $this->db->fetch_object($resql)) {
+				$rows[] = $obj;
+			}
+		}
+
+		return $rows;
+	}
+
+	/**
+	 * Revoke everything issued to one client for one user: codes, access and
+	 * refresh tokens. The client must consent again to get back in.
+	 *
+	 * @param int $clientRowid Client rowid
+	 * @param int $userId      User rowid
+	 * @return int Number of tokens revoked, -1 on error
+	 */
+	public function revokeGrant($clientRowid, $userId)
+	{
+		$sql = "UPDATE ".MAIN_DB_PREFIX.$this->config->tablePrefix."_oauth_token SET revoked = 1";
+		$sql .= " WHERE fk_client = ".((int) $clientRowid);
+		$sql .= " AND fk_user = ".((int) $userId);
+		$sql .= " AND revoked = 0";
+
+		$resql = $this->db->query($sql);
+		if (!$resql) {
+			$this->error = $this->db->lasterror();
+			return -1;
+		}
+
+		return (int) $this->db->affected_rows($resql);
+	}
+
+	/**
+	 * Number of clients registered over the last hour.
+	 *
+	 * @return int
+	 */
+	public function countRecentRegistrations()
+	{
+		$sql = "SELECT COUNT(*) as nb FROM ".MAIN_DB_PREFIX.$this->config->tablePrefix."_oauth_client";
+		$sql .= " WHERE datec > '".$this->db->idate(dol_now() - 3600)."'";
+
+		$resql = $this->db->query($sql);
+		if ($resql && ($obj = $this->db->fetch_object($resql))) {
+			return (int) $obj->nb;
+		}
+
+		return 0;
 	}
 
 	// --- Internals --------------------------------------------------------------
@@ -461,14 +613,66 @@ class OAuthServer
 	}
 
 	/**
-	 * Mark a token row as revoked.
+	 * Mark a token row as revoked, and say whether this call is the one that
+	 * did it.
+	 *
+	 * The WHERE carries "revoked = 0" and the caller checks the rows touched,
+	 * so the database decides which of two concurrent requests spends a code
+	 * or a refresh token. Reading then writing let both through: measured on
+	 * the same design, twelve parallel exchanges of one code produced five
+	 * token pairs.
 	 *
 	 * @param int $rowid Token rowid
-	 * @return void
+	 * @return bool True when this call revoked the row
 	 */
 	private function revokeToken($rowid)
 	{
-		$sql = "UPDATE ".MAIN_DB_PREFIX.$this->config->tablePrefix."_oauth_token SET revoked = 1 WHERE rowid = ".((int) $rowid);
-		$this->db->query($sql);
+		$sql = "UPDATE ".MAIN_DB_PREFIX.$this->config->tablePrefix."_oauth_token SET revoked = 1";
+		$sql .= " WHERE rowid = ".((int) $rowid)." AND revoked = 0";
+
+		$resql = $this->db->query($sql);
+		if (!$resql) {
+			return false;
+		}
+
+		return (int) $this->db->affected_rows($resql) === 1;
+	}
+
+	/**
+	 * Revoke everything issued to a client for a user whose code or refresh
+	 * token was presented a second time.
+	 *
+	 * A spent value coming back means someone else holds a copy, so the
+	 * grant it belonged to is compromised and nothing issued under it may
+	 * survive (OAuth 2.1 section 4.3.1, RFC 6749 section 4.1.2). A value that
+	 * merely expired unused is not a replay and revokes nothing.
+	 *
+	 * @param string $type        'code' | 'refresh'
+	 * @param string $value       Value presented
+	 * @param int    $clientRowid Client that presented it
+	 * @return void
+	 */
+	private function revokeReplayedFamily($type, $value, $clientRowid)
+	{
+		if (empty($value)) {
+			return;
+		}
+
+		$sql = "SELECT fk_user FROM ".MAIN_DB_PREFIX.$this->config->tablePrefix."_oauth_token";
+		$sql .= " WHERE token_type = '".$this->db->escape($type)."'";
+		$sql .= " AND token_hash = '".$this->db->escape(hash('sha256', $value))."'";
+		$sql .= " AND fk_client = ".((int) $clientRowid);
+		$sql .= " AND revoked = 1";
+
+		$resql = $this->db->query($sql);
+		if (!$resql || $this->db->num_rows($resql) !== 1) {
+			return;
+		}
+		$obj = $this->db->fetch_object($resql);
+
+		$revoked = $this->revokeGrant($clientRowid, (int) $obj->fk_user);
+		if ($revoked > 0) {
+			dol_syslog('['.$this->config->logPrefix.'] Replayed '.$type.': revoked '.$revoked.' token(s) of client '.$clientRowid.' for user '.$obj->fk_user, LOG_WARNING);
+		}
 	}
 }

@@ -71,4 +71,52 @@ final class OAuthServerTest extends TestCase
         $this->assertNull($second, 'replaying the same authorization code must fail (invalid_grant)');
         $this->assertSame('invalid_grant', $srv->error);
     }
+
+    private function grant(OAuthServer $srv, object $client, int $user = 7): array
+    {
+        $verifier = 'abcdefabcdefabcdefabcdefabcdefabcdefabcdef123';
+        $challenge = rtrim(strtr(base64_encode(hash('sha256', $verifier, true)), '+/', '-_'), '=');
+        $code = $srv->createAuthorizationCode($client, $user, 'https://claude.ai/api/mcp/auth_callback', $challenge, 'dolibarr', 'https://x/mcp.php');
+        $tokens = $srv->exchangeAuthorizationCode($client, $code, 'https://claude.ai/api/mcp/auth_callback', $verifier);
+
+        return array('code' => $code, 'tokens' => $tokens, 'verifier' => $verifier);
+    }
+
+    public function testReplayedCodeRevokesTheTokensItIssued(): void
+    {
+        $db = new FakeDoliDB();
+        $srv = $this->server($db);
+        $client = (object) ['rowid' => 1, 'token_endpoint_auth_method' => 'none'];
+        $g = $this->grant($srv, $client);
+        $this->assertNotNull($srv->validateAccessToken($g['tokens']['access_token']));
+
+        $this->assertNull($srv->exchangeAuthorizationCode($client, $g['code'], 'https://claude.ai/api/mcp/auth_callback', $g['verifier']));
+        $this->assertNull($srv->validateAccessToken($g['tokens']['access_token']), 'tokens issued from a replayed code must be revoked');
+    }
+
+    public function testReplayedRefreshTokenRevokesTheFamily(): void
+    {
+        $db = new FakeDoliDB();
+        $srv = $this->server($db);
+        $client = (object) ['rowid' => 1, 'token_endpoint_auth_method' => 'none'];
+        $g = $this->grant($srv, $client);
+
+        $rotated = $srv->refreshTokens($client, $g['tokens']['refresh_token']);
+        $this->assertNotNull($rotated);
+        $this->assertNull($srv->refreshTokens($client, $g['tokens']['refresh_token']), 'a refresh token works once');
+        $this->assertNull($srv->validateAccessToken($rotated['access_token']), 'the replay revokes what the rotation issued');
+        $this->assertNull($srv->refreshTokens($client, $rotated['refresh_token']));
+    }
+
+    public function testRevokeGrantEndsTheAccess(): void
+    {
+        $db = new FakeDoliDB();
+        $srv = $this->server($db);
+        $client = (object) ['rowid' => 1, 'token_endpoint_auth_method' => 'none'];
+        $g = $this->grant($srv, $client);
+
+        $this->assertGreaterThan(0, $srv->revokeGrant(1, 7));
+        $this->assertNull($srv->validateAccessToken($g['tokens']['access_token']));
+        $this->assertNull($srv->refreshTokens($client, $g['tokens']['refresh_token']));
+    }
 }

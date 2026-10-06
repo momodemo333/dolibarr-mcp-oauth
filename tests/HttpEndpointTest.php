@@ -35,14 +35,15 @@ final class HttpEndpointTest extends TestCase
         $this->assertSame(401, $r->httpCode);
     }
 
-    public function testOauthTokenValidButLinkedUserUnavailableReturns403(): void
+    public function testOauthTokenValidButLinkedUserUnavailableReturns401(): void
     {
         // A genuinely valid access token (issued through the real
         // authorization-code + PKCE exchange, same as OAuthServerTest) whose
         // fk_user has no corresponding row in llx_user: validateAccessToken()
         // succeeds but getUserApiKey() fails to resolve a REST API key.
-        // Per the emMCP source (htdocs/custom/emmcp/mcp.php ~L163), this must
-        // be a 403, distinct from the 401 used for an invalid/expired token.
+        // Since 1.1.0 this is a 401: the user was disabled or their API key
+        // removed, the access is over, and the client must go back through
+        // sign-in and consent rather than retry.
         $db = new FakeDoliDB();
         $oauth = new OAuthServer($db, $this->config());
 
@@ -55,8 +56,15 @@ final class HttpEndpointTest extends TestCase
 
         // No llx_user row seeded for user 999: getUserApiKey() will fail.
         $r = $this->ep($db)->resolveApiKey(['HTTP_AUTHORIZATION' => 'Bearer '.$tokens['access_token']], fn($n,$d) => '');
-        $this->assertSame(403, $r->httpCode);
-        $this->assertSame('Access token valid but the linked Dolibarr user is unavailable', $r->error);
+        $this->assertSame(401, $r->httpCode);
+        $this->assertSame('Access revoked for the linked Dolibarr user', $r->error);
         $this->assertNull($r->apiKey);
+    }
+
+    public function testSeesAuthorizationHeader(): void
+    {
+        $this->assertTrue(HttpEndpoint::seesAuthorizationHeader(['HTTP_AUTHORIZATION' => 'Bearer x']));
+        $this->assertTrue(HttpEndpoint::seesAuthorizationHeader(['REDIRECT_HTTP_AUTHORIZATION' => 'Bearer x']));
+        $this->assertFalse(HttpEndpoint::seesAuthorizationHeader([]));
     }
 }

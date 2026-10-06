@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-10-06
+
+Security and compatibility release. Every point below was found by reviewing
+this library against what the same design got wrong in the Dolibarr core
+implementation, and each is covered by a test, run against a real database
+where the fake one cannot express it.
+
+### Security
+- **An authorization code or refresh token could be spent several times
+  concurrently.** The revocation that claims it did not check whether it was
+  the one that flipped the row, so parallel requests each got a token pair.
+  The UPDATE now carries `revoked = 0` and the caller checks the rows touched:
+  twelve parallel exchanges of one code now yield exactly one pair.
+- **A replayed code or refresh token now revokes the whole grant** of that
+  client for that user (OAuth 2.1 section 4.3.1, RFC 6749 section 4.1.2). A
+  value that merely expired unused is not a replay and revokes nothing.
+- **Removing a user's REST API key did not end their OAuth access.**
+  `getUserApiKey()` generated a new key whenever the user had none, on every
+  MCP request, so the natural way to cut someone's API access was silently
+  undone by the next call. It is now read only; `ensureUserApiKey()` creates
+  the key at consent. A request whose user has no key, or is disabled, gets a
+  401 so the client goes back through sign-in.
+- `/register` is capped at 50 registrations per hour (429 beyond), and
+  clients that never obtained a token are purged after a day.
+- The PKCE challenge must be a real S256 value (43 base64url characters).
+
+### Added
+- `listGrants()` / `revokeGrant()` — the accesses currently granted, one line
+  per client and user, and the call that ends one, for an admin screen.
+- `HttpEndpoint::seesAuthorizationHeader()` — for a self-test telling an
+  administrator whether the Authorization header reaches PHP at all.
+- `OAuthRouter::metadataOpenIdConfiguration()` and `jwks()`.
+- `OAuthRouter::issuer()`, and `authorization_response_iss_parameter_supported`
+  in the metadata: modules add `iss` to every authorization response (RFC 9207).
+
+### Fixed
+- **Claude Desktop could not connect.** Clients built on the official MCP
+  TypeScript SDK (mcp-remote) reach `.well-known/openid-configuration` for an
+  issuer with a path and validate it as OpenID Connect; the RFC 8414 document
+  served there has no `jwks_uri` and was rejected (ZodError). That route now
+  gets its own document with the three OpenID fields and an empty key set; the
+  RFC 8414 document stays free of them, as claude.ai and ChatGPT require.
+- `client_secret_basic` works under PHP-FPM/CGI, where `PHP_AUTH_*` is never
+  filled: the credentials are read from the Authorization header.
+
 ## [1.0.0] - 2026-07-16
 
 Extracted from emMCP 1.0.1; parameterized via `ExposureConfig`.

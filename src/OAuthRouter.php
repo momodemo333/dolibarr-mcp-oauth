@@ -55,8 +55,23 @@ final class OAuthRouter
     // --- Discovery (RFC 8414 / OIDC discovery, RFC 9728) -----------------------
 
     /**
-     * Authorization Server Metadata (RFC 8414), also served for the
-     * OIDC-flavored .well-known/openid-configuration route (same document).
+     * The issuer, as clients must see it in metadata and in the iss
+     * parameter of every authorization response (RFC 9207).
+     *
+     * @return string
+     */
+    public function issuer(): string
+    {
+        return $this->issuerUrl;
+    }
+
+    /**
+     * Authorization Server Metadata (RFC 8414).
+     *
+     * This document must stay free of OpenID fields: carrying them is a claim
+     * to be an OpenID provider, and the claude.ai and ChatGPT connectors
+     * refuse it. The OpenID route has its own document,
+     * metadataOpenIdConfiguration().
      *
      * @return array
      */
@@ -72,8 +87,45 @@ final class OAuthRouter
             'code_challenge_methods_supported' => array('S256'),
             'token_endpoint_auth_methods_supported' => array('none', 'client_secret_basic', 'client_secret_post'),
             'scopes_supported' => array('dolibarr'),
+            // RFC 9207: the authorization response names its issuer, so a
+            // client talking to several servers cannot be made to mix them up.
+            'authorization_response_iss_parameter_supported' => true,
             'service_documentation' => 'https://github.com/momodemo333/dolibarr-mcp-server',
         );
+    }
+
+    /**
+     * The document served on .well-known/openid-configuration.
+     *
+     * A client that fetches this route validates the answer as OpenID
+     * Connect discovery, which requires jwks_uri,
+     * subject_types_supported and id_token_signing_alg_values_supported.
+     * Clients built on the official MCP TypeScript SDK (mcp-remote, hence
+     * Claude Desktop) reach this route for an issuer with a path and refuse
+     * the RFC 8414 document there. The values are honest: the key set is
+     * empty, since no id_token is ever issued and the openid scope is not
+     * offered.
+     *
+     * @return array
+     */
+    public function metadataOpenIdConfiguration(): array
+    {
+        return array_merge($this->metadataAuthorizationServer(), array(
+            'jwks_uri' => $this->issuerUrl.'/jwks',
+            'subject_types_supported' => array('public'),
+            'id_token_signing_alg_values_supported' => array('RS256'),
+        ));
+    }
+
+    /**
+     * The key set announced by metadataOpenIdConfiguration(): empty, since
+     * nothing here is signed.
+     *
+     * @return array
+     */
+    public function jwks(): array
+    {
+        return array('keys' => array());
     }
 
     /**
@@ -106,6 +158,12 @@ final class OAuthRouter
     public function handleRegister(array $body): array
     {
         $response = $this->server->registerClient($body);
+        if ($response === null && $this->server->error === 'too_many_registrations') {
+            return array(
+                'payload' => array('error' => 'too_many_requests', 'error_description' => 'Too many client registrations, try again later'),
+                'httpCode' => 429,
+            );
+        }
         if ($response === null) {
             return array(
                 'payload' => array('error' => 'invalid_client_metadata', 'error_description' => $this->server->error),
@@ -132,10 +190,24 @@ final class OAuthRouter
         $clientId = (string) $getPost('client_id', '');
         $clientSecret = (string) $getPost('client_secret', '');
 
-        // client_secret_basic support
-        if (empty($clientId) && !empty($server['PHP_AUTH_USER'])) {
-            $clientId = urldecode((string) $server['PHP_AUTH_USER']);
-            $clientSecret = urldecode((string) ($server['PHP_AUTH_PW'] ?? ''));
+        // client_secret_basic. PHP_AUTH_* is only filled by mod_php; under
+        // PHP-FPM or CGI the credentials arrive in the Authorization header,
+        // when the web server passes it on at all.
+        if (empty($clientId)) {
+            if (!empty($server['PHP_AUTH_USER'])) {
+                $clientId = urldecode((string) $server['PHP_AUTH_USER']);
+                $clientSecret = urldecode((string) ($server['PHP_AUTH_PW'] ?? ''));
+            } else {
+                $basic = (string) ($server['HTTP_AUTHORIZATION'] ?? ($server['REDIRECT_HTTP_AUTHORIZATION'] ?? ''));
+                if (stripos($basic, 'Basic ') === 0) {
+                    $pair = base64_decode(substr($basic, 6), true);
+                    if (is_string($pair) && strpos($pair, ':') !== false) {
+                        list($user, $pass) = explode(':', $pair, 2);
+                        $clientId = urldecode($user);
+                        $clientSecret = urldecode($pass);
+                    }
+                }
+            }
         }
 
         // Fail fast on an unrecognized grant_type, before touching client storage.
@@ -234,7 +306,9 @@ final class OAuthRouter
             );
         }
 
-        if ($codeChallenge === '' || strtoupper($codeChallengeMethod) !== 'S256') {
+        // An S256 challenge is the base64url of a SHA-256: 43 characters.
+        // Anything else is not one, and would only be stored to fail later.
+        if (strtoupper($codeChallengeMethod) !== 'S256' || !preg_match('/^[A-Za-z0-9_-]{43}$/', $codeChallenge)) {
             return new AuthorizeDecision(
                 valid: false,
                 client: $client,
