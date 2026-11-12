@@ -41,6 +41,17 @@ class OAuthServer
 	public $error = '';
 
 	/**
+	 * Why the last operation failed, in words an administrator can act on
+	 * ("authorization code already used", "redirect_uri differs from the one
+	 * of the authorization request"...). $error keeps the OAuth error code
+	 * the client receives; this is for logs and diagnostic screens, where
+	 * "invalid_grant" alone says nothing.
+	 *
+	 * @var string|null
+	 */
+	public $errorDetail = null;
+
+	/**
 	 * @param DoliDB        $db     Database handler
 	 * @param ExposureConfig $config Exposure configuration (prefixes, TTLs)
 	 */
@@ -256,14 +267,17 @@ class OAuthServer
 	 */
 	public function exchangeAuthorizationCode($client, $code, $redirectUri, $codeVerifier)
 	{
+		$this->errorDetail = null;
 		$row = $this->getValidToken('code', $code);
 		if (!$row) {
+			$this->errorDetail = $this->diagnoseInvalidToken('code', $code, (int) $client->rowid);
 			$this->revokeReplayedFamily('code', $code, (int) $client->rowid);
 			$this->error = 'invalid_grant';
 			return null;
 		}
 		if ((int) $row->fk_client !== (int) $client->rowid) {
 			$this->error = 'invalid_grant';
+			$this->errorDetail = 'authorization code was issued to another client';
 			return null;
 		}
 
@@ -274,22 +288,26 @@ class OAuthServer
 		// replayed.
 		if (!$this->revokeToken($row->rowid)) {
 			$this->error = 'invalid_grant';
+			$this->errorDetail = 'authorization code already used (concurrent exchange)';
 			return null;
 		}
 
 		if (!empty($row->redirect_uri) && $row->redirect_uri !== $redirectUri) {
 			$this->error = 'invalid_grant';
+			$this->errorDetail = 'redirect_uri differs from the one of the authorization request';
 			return null;
 		}
 
 		// PKCE S256 (mandatory, only supported method)
 		if (empty($row->code_challenge) || empty($codeVerifier)) {
 			$this->error = 'invalid_grant';
+			$this->errorDetail = 'PKCE code_verifier missing';
 			return null;
 		}
 		$computed = rtrim(strtr(base64_encode(hash('sha256', $codeVerifier, true)), '+/', '-_'), '=');
 		if (!hash_equals($row->code_challenge, $computed)) {
 			$this->error = 'invalid_grant';
+			$this->errorDetail = 'PKCE code_verifier does not match the code_challenge';
 			return null;
 		}
 
@@ -305,20 +323,24 @@ class OAuthServer
 	 */
 	public function refreshTokens($client, $refreshToken)
 	{
+		$this->errorDetail = null;
 		$row = $this->getValidToken('refresh', $refreshToken);
 		if (!$row) {
+			$this->errorDetail = $this->diagnoseInvalidToken('refresh', $refreshToken, (int) $client->rowid);
 			$this->revokeReplayedFamily('refresh', $refreshToken, (int) $client->rowid);
 			$this->error = 'invalid_grant';
 			return null;
 		}
 		if ((int) $row->fk_client !== (int) $client->rowid) {
 			$this->error = 'invalid_grant';
+			$this->errorDetail = 'refresh token was issued to another client';
 			return null;
 		}
 
 		// Same claim as for codes: rotation means a refresh token works once.
 		if (!$this->revokeToken($row->rowid)) {
 			$this->error = 'invalid_grant';
+			$this->errorDetail = 'refresh token already used (concurrent refresh)';
 			return null;
 		}
 
@@ -423,10 +445,21 @@ class OAuthServer
 
 		// A registration that never led to a token is a row nobody asked
 		// for: /register takes no credential, so without this the client
-		// table only grows, one row per connection attempt. A client that
-		// did obtain a token is kept whatever its age.
+		// table only grows, one row per connection attempt.
+		//
+		// Only registrations between one and seven days old are considered.
+		// "Has no token row" cannot tell an abandoned registration from a
+		// client that was used and then left idle: the token rows of an idle
+		// client are themselves purged a day after its refresh token expires
+		// (30 days), and in 1.1.0 the client went with them. The AI client
+		// still holds that client_id, so the next sign-in failed with
+		// "unknown client_id" until the user deleted and re-created the
+		// connector. A client that obtains a token always has a token row
+		// during its first week (the code row alone outlives the first day),
+		// so the window catches every abandoned registration and no used one.
 		$sql = "DELETE FROM ".MAIN_DB_PREFIX.$this->config->tablePrefix."_oauth_client";
 		$sql .= " WHERE datec < '".$this->db->idate(dol_now() - 86400)."'";
+		$sql .= " AND datec > '".$this->db->idate(dol_now() - 7 * 86400)."'";
 		$sql .= " AND rowid NOT IN (SELECT fk_client FROM ".MAIN_DB_PREFIX.$this->config->tablePrefix."_oauth_token WHERE fk_client IS NOT NULL)";
 		$this->db->query($sql);
 	}
@@ -636,6 +669,40 @@ class OAuthServer
 		}
 
 		return (int) $this->db->affected_rows($resql) === 1;
+	}
+
+	/**
+	 * Say why a code or refresh token was not accepted, for logs only.
+	 *
+	 * @param string $type        'code' | 'refresh'
+	 * @param string $value       Value presented
+	 * @param int    $clientRowid Client that presented it
+	 * @return string
+	 */
+	private function diagnoseInvalidToken($type, $value, $clientRowid)
+	{
+		$what = $type === 'code' ? 'authorization code' : 'refresh token';
+		if (empty($value)) {
+			return $what.' missing from the request';
+		}
+
+		$sql = "SELECT fk_client, expires_at, revoked FROM ".MAIN_DB_PREFIX.$this->config->tablePrefix."_oauth_token";
+		$sql .= " WHERE token_type = '".$this->db->escape($type)."'";
+		$sql .= " AND token_hash = '".$this->db->escape(hash('sha256', $value))."'";
+
+		$resql = $this->db->query($sql);
+		if (!$resql || $this->db->num_rows($resql) !== 1) {
+			return $what.' unknown (never issued by this server, or purged since it expired)';
+		}
+		$obj = $this->db->fetch_object($resql);
+		if ((int) $obj->fk_client !== (int) $clientRowid) {
+			return $what.' was issued to another client';
+		}
+		if (!empty($obj->revoked)) {
+			return $what.' already used or revoked; presenting it again revokes the whole grant';
+		}
+
+		return $what.' expired';
 	}
 
 	/**

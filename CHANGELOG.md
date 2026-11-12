@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-12
+
+### Fixed
+- **An OAuth client left idle for about a month was deleted, and the AI client
+  could no longer sign in.** The purge of abandoned registrations kept a
+  client only while it had token rows, but the token rows of an idle client
+  are themselves purged a day after its refresh token expires (30 days). The
+  AI client still held that client_id, so every new sign-in failed with
+  "unknown client_id" until the user deleted and re-created the connector.
+  Only registrations between one and seven days old are considered now: a
+  client that obtained a token always has a token row during its first week.
+
+### Added
+- `OAuthServer::$errorDetail` and `OAuthRouter::lastFailure()`: why the last
+  exchange failed, in words an administrator can act on (code or refresh token
+  unknown, expired, already used; redirect_uri mismatch; PKCE mismatch;
+  unknown client_id...). Token errors also carry it as `error_description`.
+  `$error` is unchanged.
+
 ## [1.1.0] - 2026-10-06
 
 Security and compatibility release. Every point below was found by reviewing

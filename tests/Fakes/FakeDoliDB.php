@@ -48,9 +48,19 @@ final class FakeDoliDB
     /**
      * @return FakeResultSet|bool
      */
+    /** @var string[] Every statement received, for tests that assert on the SQL itself */
+    private array $queries = [];
+
+    /** @return string[] */
+    public function queries(): array
+    {
+        return $this->queries;
+    }
+
     public function query(string $sql)
     {
         $sql = trim($sql);
+        $this->queries[] = $sql;
 
         if (preg_match('/^INSERT INTO\s+(\S+)\s*\(([^)]*)\)\s*VALUES\s*\((.*)\)$/is', $sql, $m)) {
             return $this->handleInsert($m[1], $m[2], $m[3]);

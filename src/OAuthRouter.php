@@ -39,6 +39,22 @@ namespace DolibarrMcpOAuth;
 final class OAuthRouter
 {
     /**
+     * Why the last handleToken() call failed, in words for an administrator;
+     * null after a success. See lastFailure().
+     */
+    private ?string $lastFailure = null;
+
+    /**
+     * Precise reason of the last token endpoint failure, for logs and
+     * diagnostic screens (the client only gets the OAuth error code and, when
+     * harmless, a description).
+     */
+    public function lastFailure(): ?string
+    {
+        return $this->lastFailure;
+    }
+
+    /**
      * @param OAuthServer    $server     Authorization server (client/token storage + grants)
      * @param ExposureConfig $config     Exposure configuration (prefixes, TTLs)
      * @param string         $issuerUrl  Absolute URL of the module's oauth.php (no trailing slash)
@@ -211,15 +227,21 @@ final class OAuthRouter
         }
 
         // Fail fast on an unrecognized grant_type, before touching client storage.
+        $this->lastFailure = null;
         if ($grantType !== 'authorization_code' && $grantType !== 'refresh_token') {
+            $this->lastFailure = 'unsupported grant_type "'.$grantType.'"';
             return array('payload' => array('error' => 'unsupported_grant_type'), 'httpCode' => 400);
         }
 
         $client = $this->server->getClient($clientId);
         if (!$client) {
-            return array('payload' => array('error' => 'invalid_client'), 'httpCode' => 401);
+            $this->lastFailure = $clientId === ''
+                ? 'client_id missing from the token request'
+                : 'unknown client_id (registration deleted, or made on another install): the AI client must register again';
+            return array('payload' => array('error' => 'invalid_client', 'error_description' => $this->lastFailure), 'httpCode' => 401);
         }
         if (!$this->server->authenticateClient($client, $clientSecret)) {
+            $this->lastFailure = 'client authentication failed (wrong or missing client_secret)';
             return array('payload' => array('error' => 'invalid_client'), 'httpCode' => 401);
         }
 
@@ -237,7 +259,12 @@ final class OAuthRouter
         }
 
         if ($tokens === null) {
-            return array('payload' => array('error' => $this->server->error ?: 'invalid_grant'), 'httpCode' => 400);
+            $this->lastFailure = $this->server->errorDetail ?: ($this->server->error ?: 'invalid_grant');
+            $payload = array('error' => $this->server->error ?: 'invalid_grant');
+            if ($this->server->errorDetail) {
+                $payload['error_description'] = $this->server->errorDetail;
+            }
+            return array('payload' => $payload, 'httpCode' => 400);
         }
 
         dol_syslog('['.$this->config->logPrefix.'] OAuth tokens issued to client '.$client->client_id.' (grant: '.$grantType.')', LOG_INFO);

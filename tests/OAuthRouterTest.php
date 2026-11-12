@@ -31,4 +31,16 @@ final class OAuthRouterTest extends TestCase
         $this->assertSame(400, $out['httpCode']);
         $this->assertSame('unsupported_grant_type', $out['payload']['error']);
     }
+
+    public function testUnknownClientIdIsNamedInTheFailure(): void
+    {
+        $server = $this->server(new FakeDoliDB());
+        $config = new ExposureConfig('emmcp', 'emcp_', 'EMMCP');
+        $r = new OAuthRouter($server, $config, 'https://x/oauth.php', 'https://x/mcp.php');
+        $params = ['grant_type' => 'refresh_token', 'client_id' => 'emcp_client_gone', 'refresh_token' => 'emcp_rX'];
+        $out = $r->handleToken(fn($n, $d) => $params[$n] ?? $d, []);
+        $this->assertSame(401, $out['httpCode']);
+        $this->assertSame('invalid_client', $out['payload']['error']);
+        $this->assertStringContainsString('unknown client_id', (string) $r->lastFailure());
+    }
 }

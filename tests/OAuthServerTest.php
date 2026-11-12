@@ -119,4 +119,40 @@ final class OAuthServerTest extends TestCase
         $this->assertNull($srv->validateAccessToken($g['tokens']['access_token']));
         $this->assertNull($srv->refreshTokens($client, $g['tokens']['refresh_token']));
     }
+
+    public function testFailureDetailNamesTheReason(): void
+    {
+        $db = new FakeDoliDB();
+        $srv = $this->server($db);
+        $client = (object) ['rowid' => 1, 'token_endpoint_auth_method' => 'none'];
+        $g = $this->grant($srv, $client);
+
+        $this->assertNull($srv->exchangeAuthorizationCode($client, 'emcp_cnope', 'https://claude.ai/api/mcp/auth_callback', 'v'));
+        $this->assertStringContainsString('unknown', (string) $srv->errorDetail);
+
+        $this->assertNull($srv->exchangeAuthorizationCode($client, $g['code'], 'https://claude.ai/api/mcp/auth_callback', $g['verifier']));
+        $this->assertStringContainsString('already used', (string) $srv->errorDetail);
+
+        $verifier = 'abcdefabcdefabcdefabcdefabcdefabcdefabcdef123';
+        $challenge = rtrim(strtr(base64_encode(hash('sha256', $verifier, true)), '+/', '-_'), '=');
+        $code = $srv->createAuthorizationCode($client, 7, 'https://claude.ai/api/mcp/auth_callback', $challenge, 'dolibarr', 'https://x/mcp.php');
+        $this->assertNull($srv->exchangeAuthorizationCode($client, $code, 'https://evil.example/cb', $verifier));
+        $this->assertStringContainsString('redirect_uri', (string) $srv->errorDetail);
+
+        $code = $srv->createAuthorizationCode($client, 7, 'https://claude.ai/api/mcp/auth_callback', $challenge, 'dolibarr', 'https://x/mcp.php');
+        $this->assertNull($srv->exchangeAuthorizationCode($client, $code, 'https://claude.ai/api/mcp/auth_callback', 'wrong'));
+        $this->assertStringContainsString('PKCE', (string) $srv->errorDetail);
+
+        $this->assertNotNull($srv->exchangeAuthorizationCode($client, $srv->createAuthorizationCode($client, 7, 'https://claude.ai/api/mcp/auth_callback', $challenge, 'dolibarr', 'https://x/mcp.php'), 'https://claude.ai/api/mcp/auth_callback', $verifier));
+        $this->assertNull($srv->errorDetail, 'a success clears the previous reason');
+    }
+
+    public function testPurgeOnlyConsidersRegistrationsOfTheLastWeek(): void
+    {
+        $db = new FakeDoliDB();
+        $this->server($db)->purgeExpired();
+        $sql = implode("\n", $db->queries());
+        $this->assertMatchesRegularExpression('/_oauth_client\s+WHERE datec < \'\d+\' AND datec > \'\d+\'/', $sql,
+            'an idle client whose tokens were purged must not be deleted with them');
+    }
 }
